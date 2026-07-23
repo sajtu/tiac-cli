@@ -1,0 +1,1118 @@
+#!/usr/bin/env python3
+"""TIAC-CLI inventory and Terraform generator."""
+
+from __future__ import annotations
+
+import argparse
+import configparser
+import importlib.util
+import json
+import os
+import pydoc
+import re
+import shutil
+import stat
+import sys
+import tempfile
+from pathlib import Path
+from types import ModuleType
+from typing import Any, Iterable
+
+VERSION = "0.3.1.0.4"
+VE_ID_MIN = 1
+VE_ID_MAX = 9999
+VE_ID_WIDTH = 4
+INV_ID_MIN = 1
+INV_ID_MAX = 999_999_999
+INV_ID_WIDTH = 9
+
+DNS_LABEL_RE = re.compile(r"^(?=.{1,63}$)[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
+TF_LABEL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+PLUGIN_ID_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
+TEMPLATE_LABEL_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
+
+ALIASES = {
+    "a": "add",
+    "create": "add",
+    "provision": "add",
+    "l": "list",
+    "s": "show",
+    "display": "show",
+    "ed": "edit",
+    "update": "edit",
+    "change": "edit",
+    "rm": "remove",
+    "del": "remove",
+    "delete": "remove",
+    "-h": "help",
+    "--help": "help",
+}
+
+
+class TiacError(RuntimeError):
+    pass
+
+
+def eprint(*args: object) -> None:
+    print(*args, file=sys.stderr)
+
+
+def discover_root(start: Path | None = None) -> Path:
+    """
+    Locate the TIAC managed IaC root.
+
+    TIAC-CLI is installed inside the Terraform repository:
+
+        <iac-root>/
+            tiac-cli/
+                bin/
+                    tiac-cli
+
+    The executable location is authoritative. The current working directory
+    must not affect where TIAC reads or writes inventory/configuration data.
+
+    TIAC_ROOT may override this behavior for advanced deployments.
+    """
+    env = os.environ.get("TIAC_ROOT")
+    if env:
+        root = Path(env).expanduser().resolve()
+        return root
+
+    executable = Path(__file__).resolve()
+    tiac_root = executable.parent.parent
+
+    if not (tiac_root / ".tiac-project").is_file():
+        raise TiacError(
+            f"Invalid TIAC installation root: {tiac_root}. "
+            "Missing .tiac-project"
+        )
+
+    return tiac_root
+
+
+def ensure_workspace_layout(root: Path) -> None:
+    """Ensure required TIAC-CLI runtime directories exist without overwriting data."""
+    for directory in ("config", "inventory", "template", "ve", "terraform"):
+        (root / directory).mkdir(parents=True, exist_ok=True)
+
+    global_config = root / "config" / "global.json"
+    if not global_config.exists():
+        atomic_json_write(global_config, {"vm_prefix": "tf"})
+
+
+def atomic_json_write(path: Path, data: dict[str, Any], mode: int = 0o644) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp_path, mode)
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            value = json.load(handle)
+    except FileNotFoundError as exc:
+        raise TiacError(f"Missing file: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise TiacError(
+            f"Invalid JSON in {path}: line {exc.lineno}, column {exc.colno}: {exc.msg}"
+        ) from exc
+    if not isinstance(value, dict):
+        raise TiacError(f"Expected a JSON object in {path}")
+    return value
+
+
+def normalize_ve_id(value: str | int) -> int:
+    raw = str(value).strip()
+    if not raw.isdigit():
+        raise TiacError(f"VEID must be numeric: {value!r}")
+    number = int(raw)
+    if not VE_ID_MIN <= number <= VE_ID_MAX:
+        raise TiacError(f"VEID must be between 1 and {VE_ID_MAX}")
+    return number
+
+
+def pad_ve_id(value: str | int) -> str:
+    return f"{normalize_ve_id(value):0{VE_ID_WIDTH}d}"
+
+
+def normalize_inv_id(value: str | int) -> int:
+    raw = str(value).strip()
+    if not raw.isdigit():
+        raise TiacError(f"Inventory ID must be numeric: {value!r}")
+    number = int(raw)
+    if not INV_ID_MIN <= number <= INV_ID_MAX:
+        raise TiacError(f"Inventory ID must be between 1 and {INV_ID_MAX}")
+    return number
+
+
+def pad_inv_id(value: str | int) -> str:
+    return f"{normalize_inv_id(value):0{INV_ID_WIDTH}d}"
+
+
+def inventory_dir(root: Path, value: str | int) -> Path:
+    item = pad_inv_id(value)
+    return root / "inventory" / f"{item[:3]}000000" / f"{item[:6]}000" / item
+
+
+def ve_dir(root: Path, value: str | int) -> Path:
+    return root / "ve" / pad_ve_id(value)
+
+
+def credential_path(value: str | int) -> Path:
+    return Path.home() / f".tiac_ve{pad_ve_id(value)}.key"
+
+
+def plugin_dirs(root: Path) -> Iterable[Path]:
+    base = root / "ve_plugins"
+    if not base.is_dir():
+        return
+    for child in sorted(base.iterdir()):
+        if child.is_dir() and (child / "plugin.json").is_file() and (child / "plugin.py").is_file():
+            yield child
+
+
+def load_plugin(root: Path, plugin_id: str) -> tuple[dict[str, Any], ModuleType, Path]:
+    if not PLUGIN_ID_RE.fullmatch(plugin_id):
+        raise TiacError(f"Invalid plugin ID: {plugin_id}")
+    directory = root / "ve_plugins" / plugin_id
+    metadata_path = directory / "plugin.json"
+    module_path = directory / "plugin.py"
+    if not metadata_path.is_file() or not module_path.is_file():
+        raise TiacError(f"VE plugin is not installed: {plugin_id}")
+    metadata = read_json(metadata_path)
+    spec = importlib.util.spec_from_file_location(f"tiac_plugin_{plugin_id}", module_path)
+    if spec is None or spec.loader is None:
+        raise TiacError(f"Unable to load VE plugin: {plugin_id}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return metadata, module, directory
+
+
+def installed_plugins(root: Path) -> list[dict[str, Any]]:
+    result = []
+    for directory in plugin_dirs(root):
+        data = read_json(directory / "plugin.json")
+        data["_directory"] = str(directory)
+        result.append(data)
+    return result
+
+
+def load_ves(root: Path) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    base = root / "ve"
+    if not base.is_dir():
+        return result
+    for config in sorted(base.glob("[0-9][0-9][0-9][0-9]/config.json")):
+        item = read_json(config)
+        item["_path"] = str(config.parent)
+        result.append(item)
+    return result
+
+
+def load_inventory(root: Path, include_deleted: bool = True) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for config in sorted((root / "inventory").glob("*/*/*/config.json")):
+        item = read_json(config)
+        item["_path"] = str(config.parent)
+        item["_deleted"] = (config.parent / "DELETED").exists()
+        if include_deleted or not item["_deleted"]:
+            result.append(item)
+    return result
+
+
+def load_templates(root: Path, plugin_id: str | None = None) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for path in sorted((root / "template").glob("[0-9][0-9][0-9][0-9]/*/config.json")):
+        item = read_json(path)
+        item["_path"] = str(path.parent)
+        if plugin_id is None or item.get("type") == plugin_id or item.get("type") == "pve":
+            records.append(item)
+    return records
+
+def read_credentials(veid: str | int) -> dict[str, str]:
+    path = credential_path(veid)
+    if not path.is_file():
+        raise TiacError(
+            f"Missing credentials for VE {pad_ve_id(veid)}: {path}. "
+            f"Run 'tiac-cli init-user {normalize_ve_id(veid)}'."
+        )
+    mode = stat.S_IMODE(path.stat().st_mode)
+    if mode & 0o077:
+        raise TiacError(f"Credential file permissions must be 0600: {path}")
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        parser.read(path, encoding="utf-8")
+    except configparser.Error as exc:
+        raise TiacError(f"Invalid credential file {path}: {exc}") from exc
+    if not parser.has_section("credentials"):
+        raise TiacError(f"Credential file lacks [credentials]: {path}")
+    return {key: value for key, value in parser["credentials"].items()}
+
+
+def write_credentials(veid: str | int, credentials: dict[str, str]) -> Path:
+    path = credential_path(veid)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    parser = configparser.ConfigParser(interpolation=None)
+    parser["credentials"] = credentials
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temp = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            parser.write(handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp, 0o600)
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
+    return path
+
+
+def choose(title: str, items: list[tuple[str, str]], default_index: int = 1) -> str:
+    if not items:
+        raise TiacError(f"No choices available for {title}")
+    if len(items) == 1:
+        return items[0][0]
+    print(title)
+    for index, (_, display) in enumerate(items, start=1):
+        print(f"  {index}. {display}")
+    while True:
+        raw = input(f"Select [{default_index}]: ").strip()
+        if not raw:
+            raw = str(default_index)
+        if raw.isdigit() and 1 <= int(raw) <= len(items):
+            return items[int(raw) - 1][0]
+        print("Invalid selection.")
+
+
+def prompt(label: str, default: Any | None = None, required: bool = True) -> str:
+    suffix = f" [{default}]" if default is not None else ""
+    while True:
+        value = input(f"{label}{suffix}: ").strip()
+        if value:
+            return value
+        if default is not None:
+            return str(default)
+        if not required:
+            return ""
+        print("A value is required.")
+
+
+def prompt_bool(label: str, default: bool) -> bool:
+    raw = prompt(label, "yes" if default else "no").lower()
+    if raw in {"yes", "y", "true", "1", "on"}:
+        return True
+    if raw in {"no", "n", "false", "0", "off"}:
+        return False
+    raise TiacError(f"{label} must be yes or no")
+
+
+def global_vm_prefix(root: Path) -> str:
+    path = root / "config" / "global.json"
+    if not path.is_file():
+        atomic_json_write(path, {"vm_prefix": "tf"})
+    data = read_json(path)
+    return str(data.get("vm_prefix", "tf")).strip().strip("-_")
+
+
+def template_dir(root: Path, veid: str | int, vmid: str | int) -> Path:
+    return root / "template" / pad_ve_id(veid) / pad_inv_id(vmid)
+
+
+def get_template(root: Path, veid: str | int, vmid: str | int) -> dict[str, Any]:
+    path = template_dir(root, veid, vmid) / "config.json"
+    record = read_json(path)
+    record["_path"] = str(path.parent)
+    return record
+
+
+def next_ve_id(ves: list[dict[str, Any]]) -> int:
+    used = {normalize_ve_id(item["id"]) for item in ves}
+    for candidate in range(VE_ID_MIN, VE_ID_MAX + 1):
+        if candidate not in used:
+            return candidate
+    raise TiacError("VEID space is exhausted")
+
+
+def get_ve(root: Path, value: str | int) -> dict[str, Any]:
+    path = ve_dir(root, value) / "config.json"
+    ve = read_json(path)
+    ve["_path"] = str(path.parent)
+    return ve
+
+
+def ve_display(ve: dict[str, Any]) -> str:
+    return (
+        f"{pad_ve_id(ve['id'])}  {ve['name']}  "
+        f"({ve['type']}, {ve['host']}:{ve['port']})"
+    )
+
+
+def select_ve(root: Path, requested: str | None = None) -> dict[str, Any]:
+    ves = load_ves(root)
+    if requested is not None:
+        return get_ve(root, requested)
+    if not ves:
+        raise TiacError("No Virtual Environments are configured. Run 'tiac-cli ve add'.")
+    if len(ves) == 1:
+        return ves[0]
+    selected = choose(
+        "Select Virtual Environment:",
+        [(str(ve["id"]), ve_display(ve)) for ve in ves],
+    )
+    return get_ve(root, selected)
+
+
+def plugin_verify(root: Path, ve: dict[str, Any], credentials: dict[str, str]) -> dict[str, Any]:
+    _, module, _ = load_plugin(root, ve["type"])
+    try:
+        return module.verify(ve, credentials)
+    except Exception as exc:
+        raise TiacError(str(exc)) from exc
+
+
+def cmd_ve_add(root: Path, args: argparse.Namespace) -> None:
+    plugins = installed_plugins(root)
+    if not plugins:
+        raise TiacError("No valid VE plugins are installed")
+
+    choices = [(item["id"], item["display_name"]) for item in plugins]
+    plugin_id = args.type or choose("Available Virtual Environment plugins:", choices)
+    metadata, module, _ = load_plugin(root, plugin_id)
+    required = ("wizard_add_ve", "verify", "list_used_ids", "wizard_add_template", "validate_template", "wizard_add_vm", "inspect_inventory_item", "render_provider", "render_resource")
+    missing = [name for name in required if not callable(getattr(module, name, None))]
+    if missing:
+        raise TiacError(f"VE plugin {plugin_id!r} is incomplete; missing: {', '.join(missing)}")
+
+    veid = next_ve_id(load_ves(root))
+    try:
+        result = module.wizard_add_ve(veid=veid)
+    except Exception as exc:
+        raise TiacError(str(exc)) from exc
+    if not isinstance(result, dict) or "ve" not in result or "credentials" not in result:
+        raise TiacError(f"VE plugin {plugin_id!r} returned invalid wizard data")
+
+    ve = dict(result["ve"])
+    credentials = dict(result["credentials"])
+    verification = result.get("verification", {})
+    ve["id"] = pad_ve_id(veid)
+    ve["type"] = plugin_id
+
+    target_dir = ve_dir(root, veid)
+    if target_dir.exists():
+        raise TiacError(f"VE directory already exists: {target_dir}")
+    atomic_json_write(target_dir / "config.json", ve)
+    key_path = write_credentials(veid, credentials)
+
+    print(f"Added VE {pad_ve_id(veid)}: {ve.get('name', '(unnamed)')}")
+    print(f"  Type: {metadata['display_name']}")
+    print(f"  Endpoint: {ve.get('host')}:{ve.get('port')}")
+    version = verification.get("version", {})
+    if isinstance(version, dict):
+        print(f"  Platform version: {version.get('version', 'unknown')}")
+    print(f"  Credential file: {key_path}")
+
+def cmd_ve_list(root: Path, args: argparse.Namespace) -> None:
+    ves = load_ves(root)
+    if not ves:
+        print("(no Virtual Environments)")
+        return
+    print(f"{'VEID':4}  {'TYPE':10}  {'NAME':24}  ENDPOINT")
+    print("-" * 76)
+    for ve in ves:
+        print(
+            f"{pad_ve_id(ve['id'])}  {ve['type'][:10]:10}  "
+            f"{ve['name'][:24]:24}  {ve['host']}:{ve['port']}"
+        )
+
+
+def cmd_ve_show(root: Path, args: argparse.Namespace) -> None:
+    ve = get_ve(root, args.veid)
+    output = {k: v for k, v in ve.items() if not k.startswith("_")}
+    output["credential_file"] = str(credential_path(ve["id"]))
+    output["credential_configured"] = credential_path(ve["id"]).is_file()
+    print(json.dumps(output, indent=2, sort_keys=True))
+
+
+def cmd_ve_verify(root: Path, args: argparse.Namespace) -> None:
+    ve = select_ve(root, args.veid)
+    credentials = read_credentials(ve["id"])
+    result = plugin_verify(root, ve, credentials)
+    print(f"VE {pad_ve_id(ve['id'])} verified successfully.")
+    print(f"  Resolved addresses: {', '.join(result.get('addresses', []))}")
+    print(f"  Nodes: {len(result.get('nodes', []))}")
+    print(f"  VMs/containers: {len(result.get('resources', []))}")
+
+
+def cmd_init_user(root: Path, args: argparse.Namespace) -> None:
+    ve = select_ve(root, args.veid)
+    _, module, _ = load_plugin(root, ve["type"])
+    existing: dict[str, str] = {}
+    path = credential_path(ve["id"])
+    if path.is_file():
+        existing = read_credentials(ve["id"])
+
+    username = prompt("User name (include realm, e.g. user@pve)", existing.get("username"))
+    token_name = prompt("Token Name", existing.get("token_name"))
+    token_secret = prompt("Token Secret", existing.get("token_secret"))
+    credentials = {
+        "username": username,
+        "token_name": token_name,
+        "token_id": f"{username}!{token_name}",
+        "token_secret": token_secret,
+    }
+    print("Verifying credentials...")
+    plugin_verify(root, ve, credentials)
+    written = write_credentials(ve["id"], credentials)
+    print(f"Credentials verified and saved: {written}")
+
+def all_external_ids(root: Path) -> set[int]:
+    ids: set[int] = set()
+    errors: list[str] = []
+    for ve in load_ves(root):
+        try:
+            credentials = read_credentials(ve["id"])
+            _, module, _ = load_plugin(root, ve["type"])
+            ids.update(module.list_used_ids(ve, credentials))
+        except Exception as exc:
+            errors.append(f"VE {pad_ve_id(ve['id'])}: {exc}")
+    if errors:
+        raise TiacError(
+            "Unable to verify IDs across every configured VE:\n  - "
+            + "\n  - ".join(errors)
+        )
+    return ids
+
+
+def next_global_inventory_id(root: Path) -> int:
+    inventory_ids = {
+        normalize_inv_id(item["id"])
+        for item in load_inventory(root, include_deleted=True)
+    }
+    external_ids = all_external_ids(root)
+    highest = max(inventory_ids | external_ids | {0})
+    candidate = highest + 1
+    if candidate > INV_ID_MAX:
+        raise TiacError("Inventory ID space is exhausted")
+    while candidate in inventory_ids or candidate in external_ids:
+        candidate += 1
+        if candidate > INV_ID_MAX:
+            raise TiacError("Inventory ID space is exhausted")
+    return candidate
+
+
+def terraform_label(name: str) -> str:
+    label = re.sub(r"[^A-Za-z0-9_]", "_", name)
+    if not label or not re.match(r"^[A-Za-z_]", label):
+        label = "r_" + label
+    return label
+
+
+def cmd_template_add(root: Path, args: argparse.Namespace) -> None:
+    ve = select_ve(root, args.veid)
+    credentials = read_credentials(ve["id"])
+    _, module, _ = load_plugin(root, ve["type"])
+    if not callable(getattr(module, "wizard_add_template", None)):
+        raise TiacError(f"VE plugin {ve['type']} does not support templates")
+    try:
+        record = module.wizard_add_template(ve=ve, credentials=credentials)
+    except Exception as exc:
+        raise TiacError(str(exc)) from exc
+    path = template_dir(root, ve["id"], record["source_vm_id"])
+    if path.exists():
+        raise TiacError(
+            f"Template VMID {record['source_vm_id']} is already registered for VE {pad_ve_id(ve['id'])}"
+        )
+    atomic_json_write(path / "config.json", record)
+    print(
+        f"Added Template VMID {record['source_vm_id']} to VE {pad_ve_id(ve['id'])}: "
+        f"{record['label']}"
+    )
+
+def cmd_template_list(root: Path, args: argparse.Namespace) -> None:
+    templates = load_templates(root, "pve")
+    if getattr(args, "veid", None):
+        templates = [
+            item for item in templates
+            if pad_ve_id(item["ve_id"]) == pad_ve_id(args.veid)
+        ]
+    if not templates:
+        print("(no template definitions)")
+        return
+
+    print(
+        f"{'VEID':4}  {'VMID':9}  {'NAME':24}  {'OS':20}  "
+        f"{'NODE':12}  {'SECONDARY':20}  STATUS"
+    )
+    print("-" * 125)
+    details: list[str] = []
+
+    for item in templates:
+        ve = get_ve(root, item["ve_id"])
+        credentials = read_credentials(ve["id"])
+        _, module, _ = load_plugin(root, ve["type"])
+        try:
+            live, status, changes = module.get_live_template_status(
+                ve, credentials, item
+            )
+            name = str(live.get("name", "-"))
+            os_name = str(live.get("os_display", "-"))
+            node = str(live.get("node", "-"))
+            for label, old, new in changes:
+                details.append(
+                    f"VE {pad_ve_id(item['ve_id'])} VMID {item['source_vm_id']} "
+                    f"{label}: {old or '(blank)'} -> {new or '(blank)'}"
+                )
+        except Exception as exc:
+            status = "ERROR"
+            name = os_name = node = "-"
+            details.append(
+                f"VE {pad_ve_id(item['ve_id'])} VMID {item['source_vm_id']}: {exc}"
+            )
+
+        print(
+            f"{pad_ve_id(item['ve_id'])}  {str(item['source_vm_id']):9}  "
+            f"{name[:24]:24}  {os_name[:20]:20}  {node[:12]:12}  "
+            f"{item.get('secondary_label', '')[:20]:20}  {status}"
+        )
+
+    if details:
+        print("\nTemplate integrity details:")
+        for detail in details:
+            print(f"  {detail}")
+
+def select_template(root: Path, ve: dict[str, Any]) -> dict[str, Any]:
+    templates = [
+        item for item in load_templates(root, "pve")
+        if pad_ve_id(item["ve_id"]) == pad_ve_id(ve["id"])
+    ]
+    if not templates:
+        raise TiacError(
+            f"No templates are defined for VE {pad_ve_id(ve['id'])} ({ve['name']}). "
+            "Run 'tiac-cli template add' first."
+        )
+    if len(templates) == 1:
+        return templates[0]
+    selected = choose(
+        "Select template:",
+        [
+            (
+                str(item["source_vm_id"]),
+                f"VMID {item['source_vm_id']} — {item['label']}"
+                + (f" — {item['secondary_label']}" if item.get("secondary_label") else ""),
+            )
+            for item in templates
+        ],
+    )
+    return get_template(root, ve["id"], selected)
+
+def cmd_add(root: Path, args: argparse.Namespace) -> None:
+    if args.type not in {"pve", "pve-vm", "vm"}:
+        raise TiacError("Only Proxmox VM inventory is currently supported")
+    ve = select_ve(root, args.veid)
+    template = select_template(root, ve)
+    credentials = read_credentials(ve["id"])
+    _, module, _ = load_plugin(root, ve["type"])
+    candidate = next_global_inventory_id(root)
+    try:
+        item = module.wizard_add_vm(
+            ve=ve,
+            credentials=credentials,
+            template=template,
+            inventory_id=candidate,
+            prefix=global_vm_prefix(root),
+        )
+    except Exception as exc:
+        raise TiacError(str(exc)) from exc
+    path = inventory_dir(root, candidate) / "config.json"
+    if path.exists():
+        raise TiacError(f"Inventory record already exists: {path}")
+    atomic_json_write(path, item)
+    print(f"Added pending VM inventory {pad_inv_id(candidate)}")
+    print(f"  VE: {pad_ve_id(ve['id'])} — {ve['name']}")
+    print(f"  VMID: {candidate}")
+    print(f"  Name: {item['name']}")
+
+def cmd_list(root: Path, args: argparse.Namespace) -> None:
+    records = load_inventory(root, include_deleted=True)
+    records = [r for r in records if not r.get("placeholder") or getattr(args, "all", False)]
+    if getattr(args, "type", None):
+        records = [r for r in records if r.get("type") == args.type]
+    lines = [f"{'ID':9}  {'VEID':4}  {'STATE':16}  {'TYPE':12}  NAME"]
+    lines.append("-" * 76)
+    for item in records:
+        state = "DELETED" if item.get("_deleted") else str(item.get("state", ""))
+        lines.append(
+            f"{pad_inv_id(item['id'])}  {str(item.get('ve_id','')):4}  {state[:16]:16}  "
+            f"{str(item.get('type',''))[:12]:12}  {item.get('name','')}"
+        )
+    if len(lines) == 2:
+        lines.append("(no inventory items)")
+    text = "\n".join(lines)
+    pydoc.pager(text) if sys.stdout.isatty() else print(text)
+
+def get_inventory(root: Path, value: str | int) -> tuple[Path, dict[str, Any]]:
+    path = inventory_dir(root, value)
+    item = read_json(path / "config.json")
+    item["_deleted"] = (path / "DELETED").exists()
+    return path, item
+
+
+def cmd_show(root: Path, args: argparse.Namespace) -> None:
+    path, item = get_inventory(root, args.id)
+    output = {k: v for k, v in item.items() if not k.startswith("_")}
+    output["deleted"] = item["_deleted"]
+    output["path"] = str(path)
+    print(json.dumps(output, indent=2, sort_keys=True))
+
+
+def cmd_remove(root: Path, args: argparse.Namespace) -> None:
+    path, item = get_inventory(root, args.id)
+    marker = path / "DELETED"
+    if marker.exists():
+        print(f"Inventory item {pad_inv_id(args.id)} is already marked DELETED")
+        return
+    if not args.yes:
+        answer = input(
+            f"Mark {pad_inv_id(args.id)} ({item.get('name')}) DELETED? "
+            "Type yes to continue: "
+        ).strip()
+        if answer != "yes":
+            print("Cancelled.")
+            return
+    marker.touch()
+    print(f"Marked {pad_inv_id(args.id)} DELETED")
+
+
+def write_conflict_placeholder(root: Path, old_id: int, ve: dict[str, Any], reason: str) -> None:
+    placeholder = {
+        "id": pad_inv_id(old_id),
+        "placeholder": True,
+        "state": "external-conflict",
+        "ve_id": pad_ve_id(ve["id"]),
+        "reason": reason,
+    }
+    atomic_json_write(inventory_dir(root, old_id) / "config.json", placeholder)
+
+
+def move_pending_inventory(root: Path, old_id: int, new_id: int) -> dict[str, Any]:
+    old_path, record = get_inventory(root, old_id)
+    new_path = inventory_dir(root, new_id)
+    clean = {k: v for k, v in record.items() if not k.startswith("_")}
+    clean["id"] = pad_inv_id(new_id)
+    clean["vmid"] = new_id
+    clean["description"] = re.sub(
+        r"Inventory ID: \d{9}", f"Inventory ID: {pad_inv_id(new_id)}", clean.get("description", "")
+    )
+    clean["tags"] = [
+        f"inv-{pad_inv_id(new_id)}" if str(tag).startswith("inv-") else tag
+        for tag in clean.get("tags", [])
+    ]
+    atomic_json_write(new_path / "config.json", clean)
+    shutil.rmtree(old_path)
+    return clean
+
+
+def reconcile_pending_ids(root: Path) -> list[str]:
+    notices: list[str] = []
+    pending = [
+        item for item in load_inventory(root, include_deleted=True)
+        if not item.get("_deleted") and item.get("state") == "pending" and not item.get("placeholder")
+    ]
+    for item in sorted(pending, key=lambda row: int(row["id"])):
+        ve = get_ve(root, item["ve_id"])
+        credentials = read_credentials(ve["id"])
+        _, module, _ = load_plugin(root, ve["type"])
+        result = module.inspect_inventory_item(ve, credentials, item)
+        if result["status"] == "absent":
+            continue
+        if result["status"] == "match":
+            clean = {k: v for k, v in item.items() if not k.startswith("_")}
+            clean["state"] = "managed"
+            atomic_json_write(Path(item["_path"]) / "config.json", clean)
+            notices.append(f"{item['id']} already exists and matches; marked managed.")
+            continue
+        old_id = int(item["id"])
+        new_id = next_global_inventory_id(root)
+        move_pending_inventory(root, old_id, new_id)
+        write_conflict_placeholder(root, old_id, ve, result.get("reason", "External ID conflict"))
+        notices.append(
+            f"{pad_inv_id(old_id)} was occupied externally; pending VM moved to {pad_inv_id(new_id)}."
+        )
+    return notices
+
+
+def managed_warnings(root: Path) -> list[str]:
+    warnings: list[str] = []
+    for item in load_inventory(root, include_deleted=True):
+        if item.get("_deleted") or item.get("state") != "managed" or item.get("placeholder"):
+            continue
+        ve = get_ve(root, item["ve_id"])
+        credentials = read_credentials(ve["id"])
+        _, module, _ = load_plugin(root, ve["type"])
+        result = module.inspect_inventory_item(ve, credentials, item)
+        if result["status"] == "absent":
+            warnings.append(
+                f"Managed VM {item['id']} ({item.get('name','')}) is missing from VE {item['ve_id']}; "
+                "Terraform is expected to recreate it."
+            )
+        elif result["status"] == "conflict":
+            raise TiacError(f"Managed identity conflict for {item['id']}: {result.get('reason')}")
+    return warnings
+
+
+def validate(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    ves = load_ves(root)
+    if not ves:
+        raise TiacError("At least one VE is required")
+    ve_ids: set[str] = set()
+    ve_names: set[str] = set()
+    for ve in ves:
+        veid = pad_ve_id(ve["id"])
+        if veid in ve_ids:
+            raise TiacError(f"Duplicate VEID: {veid}")
+        if ve["name"] in ve_names:
+            raise TiacError(f"Duplicate VE name: {ve['name']}")
+        load_plugin(root, ve["type"])
+        ve_ids.add(veid)
+        ve_names.add(ve["name"])
+
+    records = load_inventory(root, include_deleted=True)
+    ids: set[int] = set()
+    names: set[str] = set()
+    labels: set[str] = set()
+    for item in records:
+        iid = normalize_inv_id(item["id"])
+        if iid in ids:
+            raise TiacError(f"Duplicate inventory ID: {iid}")
+        ids.add(iid)
+        if item.get("placeholder"):
+            continue
+        if item["type"] == "pve-vm":
+            if normalize_inv_id(item["vmid"]) != iid:
+                raise TiacError(f"{iid}: PVE VMID must equal TIAC-CLI inventory ID")
+            if pad_ve_id(item["ve_id"]) not in ve_ids:
+                raise TiacError(f"{iid}: unknown VEID {item['ve_id']}")
+            if not DNS_LABEL_RE.fullmatch(item["name"]):
+                raise TiacError(f"{iid}: invalid VM name {item['name']}")
+            if item["name"] in names:
+                raise TiacError(f"Duplicate VM name: {item['name']}")
+            names.add(item["name"])
+            if not TF_LABEL_RE.fullmatch(item["terraform_label"]):
+                raise TiacError(f"{iid}: invalid Terraform label")
+            if item["terraform_label"] in labels:
+                raise TiacError(f"Duplicate Terraform label: {item['terraform_label']}")
+            labels.add(item["terraform_label"])
+    return ves, records
+
+
+def hcl(value: str) -> str:
+    return json.dumps(value)
+
+
+def render_terraform(root: Path) -> dict[str, str]:
+    ves, records = validate(root)
+    provider_meta: dict[str, dict[str, Any]] = {}
+    for ve in ves:
+        meta, _, _ = load_plugin(root, ve["type"])
+        provider_meta[ve["type"]] = meta["terraform"]
+
+    required = {}
+    for info in provider_meta.values():
+        required[info["provider_name"]] = info
+
+    versions = [
+        "# GENERATED FILE — DO NOT EDIT",
+        "# Source: ve/, template/, and inventory/",
+        "",
+        "terraform {",
+        '  required_version = ">= 1.15.0"',
+        "",
+        "  required_providers {",
+    ]
+    for name, info in sorted(required.items()):
+        versions.extend([
+            f"    {name} = {{",
+            f"      source  = {hcl(info['provider_source'])}",
+            f"      version = {hcl(info['provider_version'])}",
+            "    }",
+        ])
+    versions.extend(["  }", "}", ""])
+
+    providers = [
+        "# GENERATED FILE — DO NOT EDIT",
+        "# Credentials are supplied on the Terraform host through sensitive variables.",
+        "",
+    ]
+    variables = ["# GENERATED FILE — DO NOT EDIT", ""]
+    for ve in ves:
+        if ve["type"] != "proxmox":
+            continue
+        alias = f"ve{pad_ve_id(ve['id'])}"
+        var_name = f"tiac_{alias}_api_token"
+        variables.extend([
+            f'variable "{var_name}" {{',
+            "  type      = string",
+            "  sensitive = true",
+            "}",
+            "",
+        ])
+        providers.extend([
+            f'provider "proxmox" {{',
+            f"  alias     = {hcl(alias)}",
+            f"  endpoint  = {hcl(f'https://{ve['host']}:{ve['port']}/')}",
+            f"  api_token = var.{var_name}",
+            f"  insecure  = {str(not bool(ve.get('verify_tls', True))).lower()}",
+            "}",
+            "",
+        ])
+
+    main = [
+        "# GENERATED FILE — DO NOT EDIT",
+        "# Source: ve/, template/, and inventory/",
+        "",
+    ]
+    for item in sorted(records, key=lambda x: normalize_inv_id(x["id"])):
+        if item["_deleted"]:
+            continue
+        if item["type"] != "pve-vm":
+            continue
+        ve_alias = f"ve{pad_ve_id(item['ve_id'])}"
+        main.extend([
+            f'resource "proxmox_cloned_vm" "{item["terraform_label"]}" {{',
+            f"  provider    = proxmox.{ve_alias}",
+            f"  id          = {int(item['vmid'])}",
+            f"  node_name   = {hcl(item['node_name'])}",
+            f"  name        = {hcl(item['name'])}",
+            f"  description = {hcl(item['description'])}",
+            "",
+            "  tags = [",
+        ])
+        for tag in item["tags"]:
+            main.append(f"    {hcl(tag)},")
+        main.extend([
+            "  ]",
+            f"  started = {str(bool(item['started'])).lower()}",
+            "",
+            "  clone = {",
+            f"    source_vm_id     = {int(item['clone']['source_vm_id'])}",
+        ])
+        if item["clone"].get("source_node_name"):
+            main.append(
+                f"    source_node_name = {hcl(item['clone']['source_node_name'])}"
+            )
+        main.extend([
+            f"    full             = {str(bool(item['clone']['full'])).lower()}",
+            "  }",
+            "",
+            "  disk = {",
+            "    scsi0 = {",
+            f"      datastore_id = {hcl(item['disk']['scsi0']['datastore_id'])}",
+            f"      size_gb      = {int(item['disk']['scsi0']['size_gb'])}",
+            f"      iothread     = {str(bool(item['disk']['scsi0']['iothread'])).lower()}",
+            "    }",
+            "  }",
+            "}",
+            "",
+        ])
+
+    return {
+        "versions.tf": "\n".join(versions),
+        "providers.tf": "\n".join(providers),
+        "variables.tf": "\n".join(variables),
+        "main.tf": "\n".join(main),
+    }
+
+
+def cmd_validate(root: Path, args: argparse.Namespace) -> None:
+    files = render_terraform(root)
+    print(f"TIAC-CLI configuration for Terraform is valid. {len(files)} Terraform files can be generated.")
+    print("Terraform provider validation remains pending on the deployment host.")
+
+
+def cmd_commit(root: Path, args: argparse.Namespace) -> None:
+    pending = [
+        item for item in load_inventory(root, include_deleted=True)
+        if not item.get("_deleted") and item.get("state") == "pending" and not item.get("placeholder")
+    ]
+    print("Pending Terraform additions:")
+    if pending:
+        for item in sorted(pending, key=lambda row: int(row["id"])):
+            print(
+                f"  {item['id']}  VE {item['ve_id']}  {item.get('name','')}  "
+                f"Template VMID {item.get('clone',{}).get('source_vm_id','')}"
+            )
+    else:
+        print("  (none)")
+
+    if getattr(args, "preview", False):
+        warnings = managed_warnings(root)
+        for warning in warnings:
+            print(f"WARNING: {warning}")
+        print("Preview complete. No files were changed.")
+        return
+
+    notices = reconcile_pending_ids(root)
+    for notice in notices:
+        print(f"NOTICE: {notice}")
+    warnings = managed_warnings(root)
+    for warning in warnings:
+        print(f"WARNING: {warning}")
+
+    files = render_terraform(root)
+    output = root / "terraform"
+    output.mkdir(parents=True, exist_ok=True)
+    temp = Path(tempfile.mkdtemp(prefix=".tiac-build-", dir=output.parent))
+    try:
+        for name, content in files.items():
+            (temp / name).write_text(content, encoding="utf-8")
+        for old in output.glob("*.tf"):
+            old.unlink()
+        for new in temp.glob("*.tf"):
+            os.replace(new, output / new.name)
+    finally:
+        shutil.rmtree(temp, ignore_errors=True)
+    print(f"Generated {len(files)} Terraform files in {output}")
+    for name in sorted(files):
+        print(f"  {name}")
+
+def print_help() -> None:
+    print("""
+Usage: tiac-cli COMMAND [SUBCOMMAND] [OPTIONS]
+
+Virtual Environments:
+  ve add                         Add and verify a new VE
+  ve list                        List configured VEs
+  ve show VEID                   Show one VE
+  ve verify [VEID]               Verify endpoint and credentials
+  init-user [VEID]               Add/update current user's VE credentials
+
+Templates:
+  template add [--ve VEID]       Add and validate a Proxmox template
+  template list                  List template definitions
+
+Inventory:
+  add|create|provision|a pve     Add a PVE VM inventory item
+  list|l [TYPE] [--all]          List inventory
+  show|display|s ID              Show one inventory item
+  remove|rm|delete|del ID        Mark an inventory item DELETED
+
+Generation:
+  validate                       Validate TIAC-CLI source data for Terraform
+  commit                         Reconcile IDs and rebuild terraform/*.tf
+
+Notes:
+  - A VE is one independently managed Virtual Environment.
+  - VEIDs range from 1 through 9999.
+  - PVE VMIDs equal TIAC-CLI inventory IDs.
+  - New IDs are greater than every known TIAC-CLI and VE ID.
+  - Credentials are stored per user at ~/.tiac_ve<ID>.key.
+  - 'commit' generates Terraform; it does not run git commit.
+""")
+
+
+def parser_for(command: str, subcommand: str | None) -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(add_help=False)
+    if command == "ve":
+        if subcommand == "add":
+            p.add_argument("--type")
+        elif subcommand in {"show"}:
+            p.add_argument("veid")
+        elif subcommand == "verify":
+            p.add_argument("veid", nargs="?")
+        elif subcommand == "list":
+            pass
+        else:
+            raise TiacError("Usage: tiac-cli ve add|list|show|verify")
+    elif command == "init-user":
+        p.add_argument("veid", nargs="?")
+    elif command == "template":
+        if subcommand == "add":
+            p.add_argument("--ve", dest="veid")
+        elif subcommand == "list":
+            pass
+        else:
+            raise TiacError("Usage: tiac-cli template add|list")
+    elif command == "add":
+        p.add_argument("type", nargs="?", default="pve")
+        p.add_argument("--ve", dest="veid")
+        p.add_argument("--name")
+    elif command == "list":
+        p.add_argument("type", nargs="?")
+    elif command == "show":
+        p.add_argument("id")
+    elif command == "remove":
+        p.add_argument("id")
+        p.add_argument("-y", "--yes", action="store_true")
+    elif command in {"validate", "commit"}:
+        pass
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args:
+        print_help()
+        return 0
+    if args[0] in {"--version", "-V", "version"}:
+        print(f"tiac-cli {VERSION}")
+        return 0
+
+    raw_command = args.pop(0)
+    command = ALIASES.get(raw_command, raw_command)
+    if command in {"help", "-h", "--help"}:
+        print_help()
+        return 0
+
+    root = discover_root()
+    ensure_workspace_layout(root)
+    subcommand = None
+    if command in {"ve", "template"}:
+        if not args:
+            raise TiacError(f"Missing {command} subcommand")
+        subcommand = args.pop(0)
+
+    parser = parser_for(command, subcommand)
+    parsed = parser.parse_args(args)
+
+    handlers = {
+        ("ve", "add"): cmd_ve_add,
+        ("ve", "list"): cmd_ve_list,
+        ("ve", "show"): cmd_ve_show,
+        ("ve", "verify"): cmd_ve_verify,
+        ("init-user", None): cmd_init_user,
+        ("template", "add"): cmd_template_add,
+        ("template", "list"): cmd_template_list,
+        ("add", None): cmd_add,
+        ("list", None): cmd_list,
+        ("show", None): cmd_show,
+        ("remove", None): cmd_remove,
+        ("validate", None): cmd_validate,
+        ("commit", None): cmd_commit,
+    }
+    handler = handlers.get((command, subcommand))
+    if handler is None:
+        raise TiacError(f"Unknown command: {command}")
+    handler(root, parsed)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        eprint("\nCancelled.")
+        raise SystemExit(130)
+    except TiacError as exc:
+        eprint(f"ERROR: {exc}")
+        raise SystemExit(1)

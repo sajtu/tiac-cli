@@ -1,0 +1,8 @@
+config/
+inventory/
+template/
+ve/
+terraform/
+__pycache__
+.tiac-project
+*.backup

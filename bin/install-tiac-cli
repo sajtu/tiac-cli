@@ -1,0 +1,321 @@
+#!/bin/bash
+
+REPO_NAME="tiac-cli";
+REPO_URL="https://github.com/sajtu/tiac-cli.git"
+
+###############################################################################
+# Determine the absolute directory containing this script.
+###############################################################################
+
+SCRIPT_DIR=$(
+	cd "$(dirname "$0")" 2>/dev/null &&
+	pwd -P
+)
+
+if [[ -z "$SCRIPT_DIR" ]] || [[ ! -d "$SCRIPT_DIR" ]]; then
+	echo
+	printf '%s\n' "Error: Could not determine the script directory." >&2
+	echo
+	exit 1
+fi
+
+###############################################################################
+# Determine if installer is running from original repo or moved.
+###############################################################################
+REPO_QUICK_CHECK=0;
+if [[ -f "$SCRIPT_DIR/../LICENSE" ]] && [[ -f "$SCRIPT_DIR/../README.md" ]] && [[ -x "$SCRIPT_DIR/tiac-cli" ]] \
+	&& [[ -d "$SCRIPT_DIR/../ve_plugins" ]]; then
+	REPO_QUICK_CHECK=1;
+else
+	echo
+	printf '%s\n' "Error: Could not determine complete repo." >&2
+	printf '%s\n' "       Please redownload from:" >&2
+	printf '%s\n' "       git clone $REPO_URL" >&2
+	echo
+	exit 1
+fi
+
+###############################################################################
+# Select target directory.
+###############################################################################
+
+if [[ -n "${1:-}" ]]; then
+	TARGET_DIR=$1
+fi
+
+###############################################################################
+# Validate target.
+###############################################################################
+
+if [[ -z "$TARGET_DIR" ]]; then
+	echo
+	echo "Error: Target directory not provided by user." >&2
+	echo
+	exit 1
+fi
+
+if [[ "$TARGET_DIR" == "/" ]]; then
+	echo
+	echo "Error: Installing directly into '/' is not allowed." >&2
+	echo
+	exit 1
+fi
+
+###############################################################################
+# Check existing target.
+###############################################################################
+
+if [[ -e "$TARGET_DIR" ]]; then
+
+	if [[ ! -d "$TARGET_DIR" ]]; then
+		echo
+		printf "Error: '%s' exists but is not a directory.\n" \
+			"$TARGET_DIR" >&2
+		echo
+		exit 1
+	fi
+
+	if [[ ! -w "$TARGET_DIR" ]] || [[ ! -x "$TARGET_DIR" ]]; then
+		if [[ "$(id -u)" != "0" ]]; then
+			echo
+			printf "Error: Root access is required to install to '%s'.\n" \
+				"$TARGET_DIR" >&2
+			printf "Please run: sudo %s" "$0" >&2
+
+			if [[ -n "${1:-}" ]]; then
+				printf " '%s'" "$TARGET_DIR" >&2
+			fi
+
+			printf '\n\n' >&2
+			exit 1
+		fi
+
+		echo
+		printf "Error: Cannot write to '%s'.\n\n" \
+			"$TARGET_DIR" >&2
+		exit 1
+	fi
+
+###############################################################################
+# Check missing target.
+###############################################################################
+
+else
+	NEAREST_EXISTING_PARENT=$TARGET_DIR
+
+	while [[ ! -e "$NEAREST_EXISTING_PARENT" ]]; do
+		NEXT_PARENT=$(dirname "$NEAREST_EXISTING_PARENT" 2>/dev/null)
+
+		if [[ -z "$NEXT_PARENT" ]] || [[ "$NEXT_PARENT" == "$NEAREST_EXISTING_PARENT" ]]; then
+			break
+		fi
+
+		NEAREST_EXISTING_PARENT=$NEXT_PARENT
+	done
+
+	if [[ ! -d "$NEAREST_EXISTING_PARENT" ]]; then
+		echo
+		printf "Error: '%s' is not a valid parent directory.\n\n" \
+			"$NEAREST_EXISTING_PARENT" >&2
+		exit 1
+	fi
+
+	###############################################################################
+	# Check for proper permission.
+	###############################################################################
+
+	if [[ ! -w "$NEAREST_EXISTING_PARENT" ]] ||  [[ ! -x "$NEAREST_EXISTING_PARENT" ]]; then
+
+		if [[ "$(id -u)" != "0" ]]; then
+			echo
+			printf "Error: Root access is required to create '%s'.\n" \
+				"$TARGET_DIR" >&2
+			printf "Please run: sudo %s" "$0" >&2
+
+			if [[ -n "${1:-}" ]]; then
+				printf " '%s'" "$TARGET_DIR" >&2
+			fi
+
+			printf '\n\n' >&2
+			exit 1
+		fi
+
+		echo
+		printf "Error: Cannot create '%s'.\n\n" \
+			"$TARGET_DIR" >&2
+		exit 1
+	fi
+
+	###############################################################################
+	# Confirm directory creation.
+	###############################################################################
+
+	echo
+	printf "Target directory '%s' does not exist.\n" "$TARGET_DIR"
+	printf "Create it and install there? [y/N]: "
+	IFS= read -r CREATE_REPLY
+
+	case "$CREATE_REPLY" in
+		Y|y|YES|Yes|yes)
+			;;
+		*)
+			echo
+			echo "Installation cancelled."
+			echo
+			exit 1
+			;;
+	esac
+
+	###############################################################################
+	# Create target directory.
+	###############################################################################
+
+	if ! mkdir -p "$TARGET_DIR"; then
+		echo
+
+		if [[ "$(id -u)" != "0" ]]; then
+			printf "Error: Root access may be required to create '%s'.\n" \
+				"$TARGET_DIR" >&2
+			printf "Please run: sudo %s" "$0" >&2
+
+			if [[ -n "${1:-}" ]]; then
+				printf " '%s'" "$TARGET_DIR" >&2
+			fi
+
+			printf '\n\n' >&2
+		else
+			printf "Error: Failed to create '%s'.\n\n" \
+				"$TARGET_DIR" >&2
+		fi
+
+		exit 1
+	fi
+fi
+
+###############################################################################
+# Verify target directory.
+###############################################################################
+
+if [[ ! -d "$TARGET_DIR" ]]; then
+	echo
+	printf "Error: Target directory '%s' does not exist.\n\n" \
+		"$TARGET_DIR" >&2
+	exit 1
+fi
+
+if [[ ! -w "$TARGET_DIR" ]] || [[ ! -x "$TARGET_DIR" ]]; then
+	echo
+	printf "Error: Cannot install to '%s'.\n\n" \
+		"$TARGET_DIR" >&2
+	exit 1
+fi
+
+###############################################################################
+# Set target permissions.
+###############################################################################
+
+if ! chmod 755 "$TARGET_DIR"; then
+	echo
+	printf "Error: Failed to set permissions on '%s'.\n\n" \
+		"$TARGET_DIR" >&2
+	exit 1
+fi
+
+###############################################################################
+# Start installation
+###############################################################################
+
+
+printf '\nInstallation target: %s\n' "$TARGET_DIR"
+echo
+
+TIAC_CLI_DIR="bin config inventory template terraform ve ve_plugins/proxmox"
+
+mkdir -p $TARGET_DIR/tiac-cli 1>/dev/null 2>&1;
+if [[ -d "$TARGET_DIR/tiac-cli" ]]; then
+
+	for d in $(echo "$TIAC_CLI_DIR");
+	do
+		mkdir -p $TARGET_DIR/tiac-cli/$d 1>/dev/null 2>&1;
+
+		if [[ ! -d "$TARGET_DIR/tiac-cli/$d" ]]; then
+			echo
+			echo "Error: Could not create subdirectory: 'tiac-cli/$d'";
+			echo
+			exit 1;
+		fi
+
+	done
+
+else
+	echo
+	echo "Error: Could not create directory tree: '$TARGET_DIR/tiac-cli'";
+	echo
+	exit 1;
+fi
+
+if [[ -d "$TARGET_DIR/tiac-cli/bin" ]]; then
+	touch $TARGET_DIR/tiac-cli/.tiac-project
+fi
+
+if [[ ! -f "$TARGET_DIR/tiac-cli/.tiac-project" ]]; then
+	echo
+	echo "Error: Could not touch file: '$TARGET_DIR/tiac-cli/.tiac-project'";
+	echo
+	exit 1;
+fi
+
+## Copying files
+(
+cd $SCRIPT_DIR;
+
+# make sure that cd $SCRIPT_DIR; worked and we are there.
+if [[ -f "$SCRIPT_DIR/../LICENSE" ]] && [[ -f "$SCRIPT_DIR/../README.md" ]] && [[ -x "$SCRIPT_DIR/tiac-cli" ]] \
+	&& [[ -f "$SCRIPT_DIR/../ve_plugins/proxmox/plugin.json" ]] \
+	&& [[ -f "$SCRIPT_DIR/../ve_plugins/proxmox/plugin.py" ]]; then
+
+	# tiac-cli/bin/tiac-cli
+	echo "Installing: bin/tiac-cli to $TARGET_DIR/tiac-cli/bin/tiac-cli"
+	cp -p $SCRIPT_DIR/tiac-cli $TARGET_DIR/tiac-cli/bin/tiac-cli;
+	chmod uga+x $TARGET_DIR/tiac-cli/bin/tiac-cli;
+	if [[ ! -x "$TARGET_DIR/tiac-cli/bin/tiac-cli" ]]; then
+		echo
+		echo "Error: Failed to install: '$TARGET_DIR/tiac-cli/bin/tiac-cli'";
+		echo
+		exit 1;
+	fi
+
+	# tiac-cli/ve_plugins/proxmox/plugin.json
+	# tiac-cli/ve_plugins/proxmox/plugin.py
+	echo "Installing: /ve_plugins/proxmox to $TARGET_DIR/tiac-cli/ve_plugins/proxmox"
+	cp -p $SCRIPT_DIR/../ve_plugins/proxmox/plugin.json $TARGET_DIR/tiac-cli/ve_plugins/proxmox;
+	cp -p $SCRIPT_DIR/../ve_plugins/proxmox/plugin.py $TARGET_DIR/tiac-cli/ve_plugins/proxmox;
+	if [[ ! -f "$TARGET_DIR/tiac-cli/ve_plugins/proxmox/plugin.json" ]] || [[ ! -f "$TARGET_DIR/tiac-cli/ve_plugins/proxmox/plugin.py" ]]; then
+		echo
+		echo "Error: Failed to install: '$TARGET_DIR/tiac-cli/ve_plugins/proxmox'";
+		echo
+		exit 1;
+	fi
+
+	## updating .gitignore on $TARGET_DIR
+	GITIGNORE_FILE="$TARGET_DIR/.gitignore"
+	touch "$GITIGNORE_FILE"
+	
+	for IGNORE_ENTRY in \
+		"tiac-cli/bin/" \
+		"tiac-cli/ve_plugins/" \
+		"tiac-cli/.tiac-project"
+	do
+		if ! grep -Fxq "$IGNORE_ENTRY" "$GITIGNORE_FILE"; then
+			echo "$IGNORE_ENTRY" >> "$GITIGNORE_FILE"
+		fi
+	done
+
+	echo
+	echo "$REPO_NAME installation to $TARGET_DIR completed." 
+	echo
+
+fi
+
+)
+

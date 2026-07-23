@@ -1,0 +1,20 @@
+{
+  "id": "proxmox",
+  "display_name": "Proxmox VE",
+  "version": "0.3.1.0.2",
+  "default_port": 8006,
+  "credential_fields": [
+    "token_id",
+    "token_secret"
+  ],
+  "terraform": {
+    "provider_name": "proxmox",
+    "provider_source": "bpg/proxmox",
+    "provider_version": "0.111.0",
+    "vm_resource": "proxmox_cloned_vm"
+  },
+  "supported_inventory_types": [
+    "pve-vm"
+  ],
+  "plugin_api_version": 1
+}
