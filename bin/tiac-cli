@@ -17,7 +17,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Iterable
 
-VERSION = "0.3.1.0.4"
+VERSION = "0.3.1.0.5"
 VE_ID_MIN = 1
 VE_ID_MAX = 9999
 VE_ID_WIDTH = 4
@@ -43,6 +43,7 @@ ALIASES = {
     "rm": "remove",
     "del": "remove",
     "delete": "remove",
+    "cancel-del": "cancel-delete",
     "-h": "help",
     "--help": "help",
 }
@@ -224,7 +225,8 @@ def load_inventory(root: Path, include_deleted: bool = True) -> list[dict[str, A
         item = read_json(config)
         item["_path"] = str(config.parent)
         item["_deleted"] = (config.parent / "DELETED").exists()
-        if include_deleted or not item["_deleted"]:
+        item["_cancelled"] = (config.parent / "CANCELLED").exists()
+        if include_deleted or not (item["_deleted"] or item["_cancelled"]):
             result.append(item)
     return result
 
@@ -517,6 +519,35 @@ def terraform_label(name: str) -> str:
     return label
 
 
+def active_inventory_owner(
+    root: Path,
+    field: str,
+    value: str,
+    exclude_id: str | int | None = None,
+) -> dict[str, Any] | None:
+    excluded = normalize_inv_id(exclude_id) if exclude_id is not None else None
+    for item in load_inventory(root, include_deleted=True):
+        if item.get("placeholder"):
+            continue
+        if item.get("_deleted") or item.get("_cancelled"):
+            continue
+        if excluded is not None and normalize_inv_id(item["id"]) == excluded:
+            continue
+        if str(item.get(field, "")) == value:
+            return item
+    return None
+
+
+def prompted_vm_name(root: Path) -> str:
+    suffix = input("New VM name: ").strip()
+    clean_prefix = global_vm_prefix(root).strip().strip("-_").lower()
+    clean_suffix = suffix.strip().strip("-_").lower()
+    name = f"{clean_prefix}-{clean_suffix}" if clean_prefix else clean_suffix
+    if not DNS_LABEL_RE.fullmatch(name):
+        raise TiacError(f"Generated VM name {name!r} is invalid")
+    return name
+
+
 def cmd_template_add(root: Path, args: argparse.Namespace) -> None:
     ve = select_ve(root, args.veid)
     credentials = read_credentials(ve["id"])
@@ -633,6 +664,22 @@ def cmd_add(root: Path, args: argparse.Namespace) -> None:
         )
     except Exception as exc:
         raise TiacError(str(exc)) from exc
+    name_owner = active_inventory_owner(root, "name", str(item["name"]))
+    if name_owner is not None:
+        raise TiacError(
+            f"VM name {item['name']} is already used by inventory "
+            f"{pad_inv_id(name_owner['id'])}"
+        )
+    label_owner = active_inventory_owner(
+        root,
+        "terraform_label",
+        str(item["terraform_label"]),
+    )
+    if label_owner is not None:
+        raise TiacError(
+            f"Terraform label {item['terraform_label']} is already used by "
+            f"inventory {pad_inv_id(label_owner['id'])}"
+        )
     path = inventory_dir(root, candidate) / "config.json"
     if path.exists():
         raise TiacError(f"Inventory record already exists: {path}")
@@ -690,6 +737,8 @@ def inventory_display_state(
 ) -> str:
     if item.get("placeholder"):
         return str(item.get("state", ""))
+    if item.get("_cancelled"):
+        return "CANCELLED"
     if live_result is None:
         if item.get("_deleted"):
             return "DELETED"
@@ -728,6 +777,8 @@ def cmd_list(root: Path, args: argparse.Namespace) -> None:
         )
         if state == "DELETED" and not getattr(args, "show_deleted", False):
             continue
+        if state == "CANCELLED" and not getattr(args, "show_cancelled", False):
+            continue
         lines.append(
             f"{pad_inv_id(item['id'])}  {str(item.get('ve_id','')):4}  {state[:16]:16}  "
             f"{str(item.get('type',''))[:12]:12}  {item.get('name','')}"
@@ -741,6 +792,7 @@ def get_inventory(root: Path, value: str | int) -> tuple[Path, dict[str, Any]]:
     path = inventory_dir(root, value)
     item = read_json(path / "config.json")
     item["_deleted"] = (path / "DELETED").exists()
+    item["_cancelled"] = (path / "CANCELLED").exists()
     return path, item
 
 
@@ -748,12 +800,32 @@ def cmd_show(root: Path, args: argparse.Namespace) -> None:
     path, item = get_inventory(root, args.id)
     output = {k: v for k, v in item.items() if not k.startswith("_")}
     output["deleted"] = item["_deleted"]
+    output["cancelled"] = item["_cancelled"]
     output["path"] = str(path)
     print(json.dumps(output, indent=2, sort_keys=True))
 
 
+def inspect_inventory_live(
+    root: Path,
+    item: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        ve = get_ve(root, item["ve_id"])
+        credentials = read_credentials(ve["id"])
+        _, module, _ = load_plugin(root, ve["type"])
+        return module.inspect_inventory_item(ve, credentials, item)
+    except Exception as exc:
+        raise TiacError(
+            f"Unable to inspect inventory {pad_inv_id(item['id'])}: {exc}"
+        ) from exc
+
+
 def cmd_remove(root: Path, args: argparse.Namespace) -> None:
     path, item = get_inventory(root, args.id)
+    if item.get("_cancelled"):
+        raise TiacError(
+            f"Inventory item {pad_inv_id(args.id)} is CANCELLED"
+        )
     marker = path / "DELETED"
     if marker.exists():
         print(f"Inventory item {pad_inv_id(args.id)} is already marked DELETED")
@@ -768,6 +840,172 @@ def cmd_remove(root: Path, args: argparse.Namespace) -> None:
             return
     marker.touch()
     print(f"Marked {pad_inv_id(args.id)} DELETED")
+
+
+def cmd_cancel_delete(root: Path, args: argparse.Namespace) -> None:
+    path, item = get_inventory(root, args.id)
+    marker = path / "DELETED"
+    if item.get("_cancelled"):
+        raise TiacError(
+            f"Inventory item {pad_inv_id(args.id)} is CANCELLED"
+        )
+    if not marker.exists():
+        raise TiacError(
+            f"Inventory item {pad_inv_id(args.id)} is not marked for deletion"
+        )
+
+    result = inspect_inventory_live(root, item)
+    status = str(result.get("status", "unknown"))
+    if status == "absent":
+        raise TiacError(
+            f"VMID {item['vmid']} is already absent from the VE. "
+            f"Use 'tiac-cli remake {normalize_inv_id(item['id'])}' to build it again."
+        )
+    if status != "match":
+        reason = result.get("reason", f"live state is {status}")
+        raise TiacError(
+            f"Cannot cancel deletion for {pad_inv_id(item['id'])}: "
+            f"{reason}"
+        )
+
+    marker.unlink()
+    print(
+        f"Cancelled deletion of {pad_inv_id(item['id'])} "
+        f"({item.get('name', '')})"
+    )
+
+
+def cmd_cancel_add(root: Path, args: argparse.Namespace) -> None:
+    path, item = get_inventory(root, args.id)
+    if item.get("_cancelled"):
+        print(f"Inventory item {pad_inv_id(args.id)} is already CANCELLED")
+        return
+    if item.get("_deleted"):
+        raise TiacError(
+            f"Inventory item {pad_inv_id(args.id)} is marked for deletion"
+        )
+    if str(item.get("state", "")) != "pending":
+        raise TiacError(
+            f"Inventory item {pad_inv_id(args.id)} is not a pending addition"
+        )
+
+    result = inspect_inventory_live(root, item)
+    status = str(result.get("status", "unknown"))
+    if status != "absent":
+        if status == "match":
+            reason = "the VM already exists on the VE"
+        else:
+            reason = result.get("reason", f"live state is {status}")
+        raise TiacError(
+            f"Cannot cancel addition of {pad_inv_id(item['id'])}: {reason}"
+        )
+
+    if not args.yes:
+        answer = input(
+            f"Cancel pending addition {pad_inv_id(item['id'])} "
+            f"({item.get('name')})? Type yes to continue: "
+        ).strip()
+        if answer != "yes":
+            print("Cancelled.")
+            return
+
+    (path / "CANCELLED").touch()
+    print(f"Cancelled pending addition {pad_inv_id(item['id'])}")
+
+
+def cmd_remake(root: Path, args: argparse.Namespace) -> None:
+    path, item = get_inventory(root, args.id)
+    deleted_marker = path / "DELETED"
+    if item.get("_cancelled"):
+        raise TiacError(
+            f"Inventory item {pad_inv_id(args.id)} is CANCELLED"
+        )
+    if not deleted_marker.exists():
+        raise TiacError(
+            f"Inventory item {pad_inv_id(args.id)} is not DELETED"
+        )
+
+    result = inspect_inventory_live(root, item)
+    status = str(result.get("status", "unknown"))
+    if status == "match":
+        raise TiacError(
+            f"VMID {item['vmid']} still exists. Use "
+            f"'tiac-cli cancel-delete {normalize_inv_id(item['id'])}' instead."
+        )
+    if status != "absent":
+        reason = result.get("reason", f"live state is {status}")
+        raise TiacError(
+            f"Cannot remake {pad_inv_id(item['id'])}: "
+            f"{reason}"
+        )
+
+    clean = {key: value for key, value in item.items() if not key.startswith("_")}
+    original_name = str(clean.get("name", ""))
+    name_owner = active_inventory_owner(
+        root,
+        "name",
+        original_name,
+        exclude_id=item["id"],
+    )
+    original_label = str(clean.get("terraform_label", ""))
+    label_owner = active_inventory_owner(
+        root,
+        "terraform_label",
+        original_label,
+        exclude_id=item["id"],
+    )
+
+    if name_owner is not None or label_owner is not None:
+        if name_owner is not None:
+            print(
+                f"Original VM name {original_name} cannot be reused; it is now "
+                f"used by inventory {pad_inv_id(name_owner['id'])} "
+                f"(VMID {name_owner.get('vmid')})."
+            )
+        else:
+            print(
+                f"Original Terraform label {original_label} cannot be reused; "
+                f"it is now used by inventory {pad_inv_id(label_owner['id'])} "
+                f"(VMID {label_owner.get('vmid')})."
+            )
+        while True:
+            new_name = prompted_vm_name(root)
+            name_owner = active_inventory_owner(
+                root,
+                "name",
+                new_name,
+                exclude_id=item["id"],
+            )
+            new_label = terraform_label(new_name)
+            label_owner = active_inventory_owner(
+                root,
+                "terraform_label",
+                new_label,
+                exclude_id=item["id"],
+            )
+            if name_owner is not None:
+                print(
+                    f"VM name {new_name} is used by inventory "
+                    f"{pad_inv_id(name_owner['id'])}."
+                )
+                continue
+            if label_owner is not None:
+                print(
+                    f"Terraform label {new_label} is used by inventory "
+                    f"{pad_inv_id(label_owner['id'])}."
+                )
+                continue
+            clean["name"] = new_name
+            clean["terraform_label"] = new_label
+            break
+
+    clean["state"] = "pending"
+    atomic_json_write(path / "config.json", clean)
+    deleted_marker.unlink()
+    print(
+        f"Remake queued for {pad_inv_id(item['id'])} "
+        f"({clean.get('name', '')}); state is pending"
+    )
 
 
 def write_conflict_placeholder(root: Path, old_id: int, ve: dict[str, Any], reason: str) -> None:
@@ -803,7 +1041,10 @@ def reconcile_pending_ids(root: Path) -> list[str]:
     notices: list[str] = []
     pending = [
         item for item in load_inventory(root, include_deleted=True)
-        if not item.get("_deleted") and item.get("state") == "pending" and not item.get("placeholder")
+        if not item.get("_deleted")
+        and not item.get("_cancelled")
+        and item.get("state") == "pending"
+        and not item.get("placeholder")
     ]
     for item in sorted(pending, key=lambda row: int(row["id"])):
         ve = get_ve(root, item["ve_id"])
@@ -827,7 +1068,12 @@ def reconcile_pending_ids(root: Path) -> list[str]:
 def managed_warnings(root: Path) -> list[str]:
     warnings: list[str] = []
     for item in load_inventory(root, include_deleted=True):
-        if item.get("_deleted") or item.get("state") != "managed" or item.get("placeholder"):
+        if (
+            item.get("_deleted")
+            or item.get("_cancelled")
+            or item.get("state") != "managed"
+            or item.get("placeholder")
+        ):
             continue
         ve = get_ve(root, item["ve_id"])
         credentials = read_credentials(ve["id"])
@@ -869,6 +1115,8 @@ def validate(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
             raise TiacError(f"Duplicate inventory ID: {iid}")
         ids.add(iid)
         if item.get("placeholder"):
+            continue
+        if item.get("_deleted") or item.get("_cancelled"):
             continue
         if item["type"] == "pve-vm":
             if normalize_inv_id(item["vmid"]) != iid:
@@ -932,6 +1180,7 @@ def render_terraform(root: Path) -> dict[str, str]:
             continue
         alias = f"ve{pad_ve_id(ve['id'])}"
         var_name = f"tiac_{alias}_api_token"
+        endpoint = f"https://{ve['host']}:{ve['port']}/"
         variables.extend([
             f'variable "{var_name}" {{',
             "  type      = string",
@@ -942,7 +1191,7 @@ def render_terraform(root: Path) -> dict[str, str]:
         providers.extend([
             f'provider "proxmox" {{',
             f"  alias     = {hcl(alias)}",
-            f"  endpoint  = {hcl(f'https://{ve['host']}:{ve['port']}/')}",
+            f"  endpoint  = {hcl(endpoint)}",
             f"  api_token = var.{var_name}",
             f"  insecure  = {str(not bool(ve.get('verify_tls', True))).lower()}",
             "}",
@@ -955,7 +1204,7 @@ def render_terraform(root: Path) -> dict[str, str]:
         "",
     ]
     for item in sorted(records, key=lambda x: normalize_inv_id(x["id"])):
-        if item["_deleted"]:
+        if item["_deleted"] or item["_cancelled"]:
             continue
         if item["type"] != "pve-vm":
             continue
@@ -1015,7 +1264,10 @@ def cmd_validate(root: Path, args: argparse.Namespace) -> None:
 def cmd_commit(root: Path, args: argparse.Namespace) -> None:
     pending = [
         item for item in load_inventory(root, include_deleted=True)
-        if not item.get("_deleted") and item.get("state") == "pending" and not item.get("placeholder")
+        if not item.get("_deleted")
+        and not item.get("_cancelled")
+        and item.get("state") == "pending"
+        and not item.get("placeholder")
     ]
     print("Pending Terraform additions:")
     if pending:
@@ -1075,10 +1327,13 @@ Templates:
 
 Inventory:
   add|create|provision|a pve     Add a PVE VM inventory item
-  list|l [TYPE] [--show-deleted] [--cached]
+  list|l [TYPE] [--show-deleted] [--show-cancelled] [--cached]
                                   List inventory using live VE state
   show|display|s ID              Show one inventory item
   remove|rm|delete|del ID        Mark an inventory item DELETED
+  cancel-delete|cancel-del ID    Cancel deletion while the VM still exists
+  cancel-add ID                  Cancel an unprovisioned pending addition
+  remake ID                      Rebuild a fully deleted VM from its inventory
 
 Generation:
   validate                       Validate TIAC-CLI source data for Terraform
@@ -1131,15 +1386,24 @@ def parser_for(command: str, subcommand: str | None) -> argparse.ArgumentParser:
             help="Include fully deleted inventory records",
         )
         p.add_argument(
+            "--show-cancelled",
+            "--display-cancelled",
+            dest="show_cancelled",
+            action="store_true",
+            help="Include cancelled inventory records",
+        )
+        p.add_argument(
             "--cached",
             action="store_true",
             help="Do not query live VE state",
         )
     elif command == "show":
         p.add_argument("id")
-    elif command == "remove":
+    elif command in {"remove", "cancel-add"}:
         p.add_argument("id")
         p.add_argument("-y", "--yes", action="store_true")
+    elif command in {"cancel-delete", "remake"}:
+        p.add_argument("id")
     elif command in {"validate", "commit"}:
         pass
     return p
@@ -1183,6 +1447,9 @@ def main(argv: list[str] | None = None) -> int:
         ("list", None): cmd_list,
         ("show", None): cmd_show,
         ("remove", None): cmd_remove,
+        ("cancel-delete", None): cmd_cancel_delete,
+        ("cancel-add", None): cmd_cancel_add,
+        ("remake", None): cmd_remake,
         ("validate", None): cmd_validate,
         ("commit", None): cmd_commit,
     }
