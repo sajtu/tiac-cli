@@ -711,8 +711,6 @@ def inventory_display_state(
 
 def cmd_list(root: Path, args: argparse.Namespace) -> None:
     records = load_inventory(root, include_deleted=True)
-    if not getattr(args, "show_deleted", False):
-        records = [r for r in records if not r.get("_deleted")]
     records = [r for r in records if not r.get("placeholder") or getattr(args, "all", False)]
     if getattr(args, "type", None):
         records = [r for r in records if r.get("type") == args.type]
@@ -728,6 +726,8 @@ def cmd_list(root: Path, args: argparse.Namespace) -> None:
             item,
             live_results.get(str(item["id"])),
         )
+        if state == "DELETED" and not getattr(args, "show_deleted", False):
+            continue
         lines.append(
             f"{pad_inv_id(item['id'])}  {str(item.get('ve_id','')):4}  {state[:16]:16}  "
             f"{str(item.get('type',''))[:12]:12}  {item.get('name','')}"
@@ -1128,7 +1128,7 @@ def parser_for(command: str, subcommand: str | None) -> argparse.ArgumentParser:
             "--display-deleted",
             dest="show_deleted",
             action="store_true",
-            help="Include deleted inventory records",
+            help="Include fully deleted inventory records",
         )
         p.add_argument(
             "--cached",
@@ -1202,3 +1202,4 @@ if __name__ == "__main__":
     except TiacError as exc:
         eprint(f"ERROR: {exc}")
         raise SystemExit(1)
+
