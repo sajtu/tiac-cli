@@ -8,7 +8,6 @@ import configparser
 import importlib.util
 import json
 import os
-import pydoc
 import re
 import shutil
 import stat
@@ -643,15 +642,90 @@ def cmd_add(root: Path, args: argparse.Namespace) -> None:
     print(f"  VMID: {candidate}")
     print(f"  Name: {item['name']}")
 
+
+def live_inventory_results(
+    root: Path,
+    records: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    results: dict[str, dict[str, Any]] = {}
+    records_by_ve: dict[str, list[dict[str, Any]]] = {}
+
+    for item in records:
+        if item.get("placeholder"):
+            continue
+        veid = pad_ve_id(item["ve_id"])
+        records_by_ve.setdefault(veid, []).append(item)
+
+    for veid, ve_records in sorted(records_by_ve.items()):
+        try:
+            ve = get_ve(root, veid)
+            credentials = read_credentials(ve["id"])
+            _, module, _ = load_plugin(root, ve["type"])
+
+            bulk_inspector = getattr(module, "inspect_inventory_items", None)
+            if callable(bulk_inspector):
+                results.update(
+                    bulk_inspector(ve, credentials, ve_records)
+                )
+                continue
+
+            inspector = getattr(module, "inspect_inventory_item", None)
+            if not callable(inspector):
+                continue
+            for item in ve_records:
+                results[str(item["id"])] = inspector(
+                    ve,
+                    credentials,
+                    item,
+                )
+        except Exception as exc:
+            eprint(f"WARNING: Unable to inspect live state for VE {veid}: {exc}")
+
+    return results
+
+
+def inventory_display_state(
+    item: dict[str, Any],
+    live_result: dict[str, Any] | None,
+) -> str:
+    if item.get("placeholder"):
+        return str(item.get("state", ""))
+    if live_result is None:
+        if item.get("_deleted"):
+            return "DELETED"
+        return str(item.get("state", "UNKNOWN"))
+
+    live_status = live_result.get("status")
+    if live_status == "conflict":
+        return "CONFLICT"
+    if item.get("_deleted"):
+        return "DELETED" if live_status == "absent" else "DELETE-PENDING"
+    if live_status == "match":
+        return "managed"
+    if live_status == "absent":
+        if str(item.get("state", "")) == "managed":
+            return "MISSING"
+        return "pending"
+    return "UNKNOWN"
+
+
 def cmd_list(root: Path, args: argparse.Namespace) -> None:
     records = load_inventory(root, include_deleted=True)
     records = [r for r in records if not r.get("placeholder") or getattr(args, "all", False)]
     if getattr(args, "type", None):
         records = [r for r in records if r.get("type") == args.type]
+    live_results = (
+        {}
+        if getattr(args, "cached", False)
+        else live_inventory_results(root, records)
+    )
     lines = [f"{'ID':9}  {'VEID':4}  {'STATE':16}  {'TYPE':12}  NAME"]
     lines.append("-" * 76)
     for item in records:
-        state = "DELETED" if item.get("_deleted") else str(item.get("state", ""))
+        state = inventory_display_state(
+            item,
+            live_results.get(str(item["id"])),
+        )
         lines.append(
             f"{pad_inv_id(item['id'])}  {str(item.get('ve_id','')):4}  {state[:16]:16}  "
             f"{str(item.get('type',''))[:12]:12}  {item.get('name','')}"
@@ -659,7 +733,7 @@ def cmd_list(root: Path, args: argparse.Namespace) -> None:
     if len(lines) == 2:
         lines.append("(no inventory items)")
     text = "\n".join(lines)
-    pydoc.pager(text) if sys.stdout.isatty() else print(text)
+    print(text)
 
 def get_inventory(root: Path, value: str | int) -> tuple[Path, dict[str, Any]]:
     path = inventory_dir(root, value)
@@ -737,10 +811,6 @@ def reconcile_pending_ids(root: Path) -> list[str]:
         if result["status"] == "absent":
             continue
         if result["status"] == "match":
-            clean = {k: v for k, v in item.items() if not k.startswith("_")}
-            clean["state"] = "managed"
-            atomic_json_write(Path(item["_path"]) / "config.json", clean)
-            notices.append(f"{item['id']} already exists and matches; marked managed.")
             continue
         old_id = int(item["id"])
         new_id = next_global_inventory_id(root)
@@ -1003,7 +1073,8 @@ Templates:
 
 Inventory:
   add|create|provision|a pve     Add a PVE VM inventory item
-  list|l [TYPE] [--all]          List inventory
+  list|l [TYPE] [--all] [--cached]
+                                  List inventory using live VE state
   show|display|s ID              Show one inventory item
   remove|rm|delete|del ID        Mark an inventory item DELETED
 
@@ -1049,6 +1120,12 @@ def parser_for(command: str, subcommand: str | None) -> argparse.ArgumentParser:
         p.add_argument("--name")
     elif command == "list":
         p.add_argument("type", nargs="?")
+        p.add_argument("--all", action="store_true")
+        p.add_argument(
+            "--cached",
+            action="store_true",
+            help="Do not query live VE state",
+        )
     elif command == "show":
         p.add_argument("id")
     elif command == "remove":

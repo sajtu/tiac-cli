@@ -203,6 +203,158 @@ def list_storages(
     return sorted(data, key=lambda item: str(item.get("storage", "")))
 
 
+def list_all_storages(
+    ve: dict[str, Any],
+    credentials: dict[str, str],
+    node_name: str,
+) -> list[dict[str, Any]]:
+    data = api_get(
+        ve,
+        credentials,
+        f"/nodes/{urllib.parse.quote(node_name)}/storage",
+    )
+    return sorted(data, key=lambda item: str(item.get("storage", "")))
+
+
+_TEMPLATE_DISK_RE = re.compile(
+    r"^(?:(?:ide|sata|scsi|virtio)\d+|efidisk0|tpmstate0)$"
+)
+_VOLUME_STORAGE_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9_.-]*):")
+
+
+def _template_storage_ids(config: dict[str, Any]) -> set[str]:
+    """Return every Proxmox storage ID backing an attached template disk."""
+    storage_ids: set[str] = set()
+
+    for key, raw_value in config.items():
+        if not _TEMPLATE_DISK_RE.fullmatch(str(key)):
+            continue
+
+        value = str(raw_value).strip()
+        if not value:
+            continue
+
+        volume = value.split(",", 1)[0].strip()
+        if volume == "none":
+            continue
+
+        match = _VOLUME_STORAGE_RE.match(volume)
+        if match is None:
+            raise PluginError(
+                f"Unable to determine storage for template disk {key}: {value}"
+            )
+        storage_ids.add(match.group(1))
+
+    return storage_ids
+
+
+def _storage_is_shared(storage: dict[str, Any]) -> bool:
+    value = storage.get("shared", 0)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in {"1", "yes", "true", "on"}
+
+
+def _storage_is_available(storage: dict[str, Any]) -> bool:
+    for field in ("enabled", "active"):
+        value = storage.get(field, 1)
+        if isinstance(value, bool):
+            available = value
+        elif isinstance(value, (int, float)):
+            available = value != 0
+        else:
+            available = str(value).strip().lower() in {"1", "yes", "true", "on"}
+        if not available:
+            return False
+    return True
+
+
+def valid_clone_nodes(
+    ve: dict[str, Any],
+    credentials: dict[str, str],
+    live_template: dict[str, Any],
+    online_nodes: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Return online nodes proven able to access all template disk storage.
+
+    Any non-shared template storage restricts cloning to the template's
+    current node. Templates backed entirely by shared storage may be cloned
+    only to online nodes where every required storage is active.
+    """
+    source_node = str(live_template.get("node", "")).strip()
+    if not source_node:
+        raise PluginError("Unable to determine the Proxmox Template source Node.")
+
+    source_vmid = int(live_template["vmid"])
+    config = get_qemu_config(ve, credentials, source_node, source_vmid)
+    storage_ids = _template_storage_ids(config)
+
+    # A diskless template has no storage-based node restriction.
+    if not storage_ids:
+        return online_nodes
+
+    source_storages = {
+        str(item.get("storage", "")): item
+        for item in list_all_storages(ve, credentials, source_node)
+    }
+    unknown = sorted(storage_ids - source_storages.keys())
+    if unknown:
+        raise PluginError(
+            "Unable to verify template storage availability: "
+            + ", ".join(unknown)
+        )
+    unavailable = sorted(
+        storage_id
+        for storage_id in storage_ids
+        if not _storage_is_available(source_storages[storage_id])
+    )
+    if unavailable:
+        raise PluginError(
+            "Template storage is not active on its source Node: "
+            + ", ".join(unavailable)
+        )
+
+    non_shared = sorted(
+        storage_id
+        for storage_id in storage_ids
+        if not _storage_is_shared(source_storages[storage_id])
+    )
+    if non_shared:
+        matches = [
+            node
+            for node in online_nodes
+            if str(node.get("node", "")) == source_node
+        ]
+        if not matches:
+            raise PluginError(
+                f"Template VMID {source_vmid} uses local storage "
+                f"({', '.join(non_shared)}), but source Node {source_node} "
+                "is not online."
+            )
+        return matches
+
+    valid: list[dict[str, Any]] = []
+    for node in online_nodes:
+        node_name = str(node.get("node", ""))
+        available = {
+            str(item.get("storage", ""))
+            for item in list_all_storages(ve, credentials, node_name)
+            if _storage_is_available(item)
+        }
+        if storage_ids <= available:
+            valid.append(node)
+
+    if not valid:
+        raise PluginError(
+            f"No online Proxmox Node can access all storage required by "
+            f"Template VMID {source_vmid}: {', '.join(sorted(storage_ids))}"
+        )
+    return valid
+
+
 def credential_prompt_names() -> tuple[str, str]:
     return ("Proxmox API token ID", "Proxmox API token secret")
 
@@ -408,7 +560,7 @@ def wizard_add_vm(*, ve: dict[str, Any], credentials: dict[str, str], template: 
     print(f"Checking connection to {ve['name']} ({ve['host']}:{ve['port']})...")
     verify(ve, credentials)
     print(f"Revalidating Proxmox Template VMID {template['source_vm_id']}...")
-    validate_template(ve, credentials, template)
+    live_template = validate_template(ve, credentials, template)
     print("Template is valid.")
 
     suffix = _prompt("VM name")
@@ -421,9 +573,16 @@ def wizard_add_vm(*, ve: dict[str, Any], credentials: dict[str, str], template: 
     nodes = [n for n in list_nodes(ve, credentials) if n.get("status") == "online"]
     if not nodes:
         raise PluginError("No online Proxmox Nodes are available.")
-    target_node = _choose("Select Proxmox target Node", [
-        (str(n["node"]), f"{n['node']} ({n.get('status','unknown')})") for n in nodes
-    ])
+    nodes = valid_clone_nodes(ve, credentials, live_template, nodes)
+    node_choices = [
+        (str(n["node"]), f"{n['node']} ({n.get('status','unknown')})")
+        for n in nodes
+    ]
+    if len(node_choices) == 1:
+        target_node = node_choices[0][0]
+        print(f"Proxmox target Node: {node_choices[0][1]} (automatically selected)")
+    else:
+        target_node = _choose("Select Proxmox target Node", node_choices)
     storages = list_storages(ve, credentials, target_node)
     if not storages:
         raise PluginError(f"No VM-capable Storage was found on Node {target_node}.")
@@ -452,7 +611,7 @@ def wizard_add_vm(*, ve: dict[str, Any], credentials: dict[str, str], template: 
         "started": True,
         "clone": {
             "source_vm_id": int(template["source_vm_id"]),
-            "source_node_name": template.get("source_node_name"),
+            "source_node_name": live_template["node"],
             "full": True,
         },
         "disk": {
@@ -465,8 +624,10 @@ def wizard_add_vm(*, ve: dict[str, Any], credentials: dict[str, str], template: 
     }
 
 
-def inspect_inventory_item(ve: dict[str, Any], credentials: dict[str, str], item: dict[str, Any]) -> dict[str, Any]:
-    resource = get_vm_resource(ve, credentials, int(item["vmid"]))
+def _inspect_inventory_resource(
+    item: dict[str, Any],
+    resource: dict[str, Any] | None,
+) -> dict[str, Any]:
     if resource is None:
         return {"status": "absent"}
     if str(resource.get("name", "")) == str(item.get("name", "")):
@@ -475,6 +636,35 @@ def inspect_inventory_item(ve: dict[str, Any], credentials: dict[str, str], item
         "status": "conflict",
         "resource": resource,
         "reason": f"VMID {item['vmid']} belongs to {resource.get('name') or '(unnamed object)'}",
+    }
+
+
+def inspect_inventory_item(
+    ve: dict[str, Any],
+    credentials: dict[str, str],
+    item: dict[str, Any],
+) -> dict[str, Any]:
+    resource = get_vm_resource(ve, credentials, int(item["vmid"]))
+    return _inspect_inventory_resource(item, resource)
+
+
+def inspect_inventory_items(
+    ve: dict[str, Any],
+    credentials: dict[str, str],
+    items: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Inspect multiple inventory records using one Proxmox resource query."""
+    resources = {
+        int(resource["vmid"]): resource
+        for resource in list_vm_resources(ve, credentials)
+        if "vmid" in resource
+    }
+    return {
+        str(item["id"]): _inspect_inventory_resource(
+            item,
+            resources.get(int(item["vmid"])),
+        )
+        for item in items
     }
 
 
