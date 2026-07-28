@@ -711,6 +711,8 @@ def inventory_display_state(
 
 def cmd_list(root: Path, args: argparse.Namespace) -> None:
     records = load_inventory(root, include_deleted=True)
+    if not getattr(args, "show_deleted", False):
+        records = [r for r in records if not r.get("_deleted")]
     records = [r for r in records if not r.get("placeholder") or getattr(args, "all", False)]
     if getattr(args, "type", None):
         records = [r for r in records if r.get("type") == args.type]
@@ -1073,7 +1075,7 @@ Templates:
 
 Inventory:
   add|create|provision|a pve     Add a PVE VM inventory item
-  list|l [TYPE] [--all] [--cached]
+  list|l [TYPE] [--show-deleted] [--cached]
                                   List inventory using live VE state
   show|display|s ID              Show one inventory item
   remove|rm|delete|del ID        Mark an inventory item DELETED
@@ -1121,6 +1123,13 @@ def parser_for(command: str, subcommand: str | None) -> argparse.ArgumentParser:
     elif command == "list":
         p.add_argument("type", nargs="?")
         p.add_argument("--all", action="store_true")
+        p.add_argument(
+            "--show-deleted",
+            "--display-deleted",
+            dest="show_deleted",
+            action="store_true",
+            help="Include deleted inventory records",
+        )
         p.add_argument(
             "--cached",
             action="store_true",
